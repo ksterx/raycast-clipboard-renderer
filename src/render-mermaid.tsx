@@ -15,6 +15,7 @@ import { showFailureToast } from "@raycast/utils";
 import { deflate } from "pako";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { useCallback, useEffect, useState } from "react";
 
 interface Preferences {
@@ -103,9 +104,12 @@ export default function RenderMermaid() {
       );
       await writeFile(imagePath, buffer);
 
+      // supportPath contains a space ("Application Support"); a bare path breaks
+      // markdown image syntax, so render it as a properly-encoded file:// URL.
+      const fileUrl = pathToFileURL(imagePath).href;
       setState({
         isLoading: false,
-        markdown: `![Mermaid diagram](${imagePath})`,
+        markdown: `![Mermaid diagram](${fileUrl})`,
         imagePath,
         imageUrl: url,
         editorUrl: editUrl,
