@@ -19,7 +19,7 @@ import { access, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 const execFileAsync = promisify(execFile);
 
@@ -128,7 +128,7 @@ function resolveTheme(pref: Preferences["theme"]): string {
 function encodePako(code: string, theme: string): string {
   const state = {
     code,
-    mermaid: JSON.stringify({ theme }),
+    mermaid: { theme },
     autoSync: true,
     updateDiagram: true,
   };
@@ -155,10 +155,18 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-async function loginShell(command: string, timeout: number): Promise<string> {
-  const { stdout } = await execFileAsync(LOGIN_SHELL, ["-lic", command], {
-    timeout,
-  });
+async function loginShell(
+  command: string,
+  timeout: number,
+  interactive = true,
+): Promise<string> {
+  const { stdout } = await execFileAsync(
+    LOGIN_SHELL,
+    [interactive ? "-lic" : "-lc", command],
+    {
+      timeout,
+    },
+  );
   return stdout;
 }
 
@@ -177,7 +185,7 @@ async function detectMermaidCli(): Promise<string | null> {
 // mmdc resolvable on PATH (Homebrew, or a rehashed nodenv/nvm shim).
 async function mermaidCliOnPath(): Promise<string | null> {
   try {
-    const path = (await loginShell("command -v mmdc", 8_000))
+    const path = (await loginShell("command -v mmdc 2>/dev/null", 8_000, false))
       .split("\n")
       .map((line) => line.trim())
       .filter((line) => line.startsWith("/") && line.endsWith("mmdc"))
@@ -192,7 +200,9 @@ async function mermaidCliOnPath(): Promise<string | null> {
 // look in npm's global bin directory.
 async function mermaidCliInNpmPrefix(): Promise<string | null> {
   try {
-    const prefix = (await loginShell("npm prefix -g", 8_000)).trim();
+    const prefix = (
+      await loginShell("npm prefix -g 2>/dev/null", 8_000, false)
+    ).trim();
     if (!prefix.startsWith("/")) {
       return null;
     }
@@ -220,7 +230,7 @@ async function renderMermaidLocally(
   const outputPath = join(environment.supportPath, `mmdc-${id}.png`);
   try {
     await writeFile(inputPath, code, "utf8");
-    const command = [
+    const baseArgs = [
       cliPath,
       "--input",
       inputPath,
@@ -230,13 +240,21 @@ async function renderMermaidLocally(
       theme,
       "--backgroundColor",
       "transparent",
-      "--scale",
-      String(MMDC_SCALE),
-    ]
-      .map(shellQuote)
-      .join(" ");
-    await loginShell(command, 60_000);
-    // `await` before the finally runs, so cleanup can't delete the file mid-read.
+    ];
+    try {
+      const command = [...baseArgs, "--scale", String(MMDC_SCALE)]
+        .map(shellQuote)
+        .join(" ");
+      await loginShell(command, 60_000);
+    } catch (error) {
+      const stderr =
+        (error as { stderr?: string | Buffer }).stderr?.toString() ?? "";
+      if (!stderr.includes("unknown option") && !stderr.includes("--scale")) {
+        throw error;
+      }
+      const command = baseArgs.map(shellQuote).join(" ");
+      await loginShell(command, 60_000);
+    }
     return await readFile(outputPath);
   } finally {
     await rm(inputPath, { force: true });
@@ -314,7 +332,21 @@ const mermaidRenderer: Renderer = {
     // Render on-device with mmdc when available (an explicit path wins, else
     // auto-detect); only fall back to mermaid.ink when no local binary exists.
     const explicitCli = ctx.mermaidCliPath?.trim() || undefined;
-    const localCli = explicitCli ?? (await detectMermaidCli()) ?? undefined;
+    let validatedExplicitCli: string | undefined;
+    if (explicitCli) {
+      try {
+        await access(explicitCli);
+        validatedExplicitCli = explicitCli;
+      } catch {
+        await showToast({
+          style: Toast.Style.Failure,
+          title: "Configured Mermaid CLI not found",
+          message: "Falling back to auto-detection",
+        });
+      }
+    }
+    const localCli =
+      validatedExplicitCli ?? (await detectMermaidCli()) ?? undefined;
 
     try {
       let buffer: Buffer;
@@ -354,13 +386,19 @@ const mermaidRenderer: Renderer = {
       if (stderr) {
         message = `${message}\n${stderr.toString().trim()}`;
       }
+      const egressNotice = localCli
+        ? ""
+        : "\n\n---\n\n> ⚠️ Your clipboard content was sent to **mermaid.ink** during this attempt (it left your machine). Install [`mmdc`](https://github.com/mermaid-js/mermaid-cli) (`npm i -g @mermaid-js/mermaid-cli`) for fully local rendering.";
       return {
-        markdown: renderErrorMarkdown(
-          localCli ? `the local Mermaid CLI (\`${localCli}\`)` : "mermaid.ink",
-          message,
-          code,
-          "mermaid",
-        ),
+        markdown:
+          renderErrorMarkdown(
+            localCli
+              ? `the local Mermaid CLI (\`${localCli}\`)`
+              : "mermaid.ink",
+            message,
+            code,
+            "mermaid",
+          ) + egressNotice,
         source: code,
         editorUrl,
         failure: error,
@@ -400,11 +438,15 @@ export default function RenderFromClipboard() {
     markdown: "",
   });
 
+  const renderIdRef = useRef(0);
+
   const render = useCallback(async () => {
+    const renderId = ++renderIdRef.current;
     setState({ isLoading: true, markdown: "" });
 
     const code = (await Clipboard.readText())?.trim();
     if (!code) {
+      if (renderId !== renderIdRef.current) return;
       setState({
         isLoading: false,
         markdown:
@@ -418,12 +460,14 @@ export default function RenderFromClipboard() {
 
     try {
       const { failure, ...output } = await renderer.render(code, ctx);
+      if (renderId !== renderIdRef.current) return;
       if (failure) {
         await showFailureToast(failure, { title: "Failed to render" });
       }
       setState({ isLoading: false, ...output });
     } catch (error) {
       // Safety net for an unexpected throw a renderer didn't handle itself.
+      if (renderId !== renderIdRef.current) return;
       await showFailureToast(error, { title: "Failed to render" });
       setState({
         isLoading: false,
